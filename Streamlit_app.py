@@ -1,5 +1,5 @@
 # streamlit_app.py
-import time, json, requests, pandas as pd, numpy as np, os
+import time, json, requests, pandas as pd, numpy as np
 import matplotlib.pyplot as plt, streamlit as st
 from datetime import datetime
 from math import log, sqrt
@@ -23,9 +23,6 @@ STRIKE_MAX    = 6100
 # OAuth token management
 # ---------------------------
 def load_tokens():
-    if not os.path.exists(TOKEN_FILE):
-        st.error("Token file not found. Please upload 'schwab_tokens.json' via the file uploader below.")
-        st.stop()
     with open(TOKEN_FILE) as f:
         return json.load(f)
 
@@ -87,6 +84,9 @@ def black_scholes_vanna(S, K, T, sigma, r=0.0):
     d2 = d1 - sigma * sqrt(T)
     return -d2 * norm.pdf(d1) / sigma
 
+# ---------------------------
+# Smoothed IV interpolation
+# ---------------------------
 def get_smoothed_iv(strikes, ivs):
     s = np.array(strikes); v = np.array(ivs)
     mask = ~np.isnan(v)
@@ -98,6 +98,9 @@ def get_smoothed_iv(strikes, ivs):
     v_u = [v[idx][np.where(s[idx]==k)[0][0]] for k in s_u]
     return make_interp_spline(s_u, v_u, k=3)
 
+# ---------------------------
+# Build exposures DataFrame
+# ---------------------------
 def chain_to_df(chain, spot):
     rows = []
     for exp, strikes in chain.get('callExpDateMap', {}).items():
@@ -148,6 +151,9 @@ def chain_to_df(chain, spot):
     df['final_composite'] = df[['n_gex','n_dex','n_vex','n_dir_gamma']].sum(axis=1)
     return df
 
+# ---------------------------
+# Plotting
+# ---------------------------
 def make_composite_figure(df):
     fig, ax = plt.subplots(figsize=(10,5))
     ax.plot(df['strike'], df['final_composite'], marker='o', linewidth=2)
@@ -155,9 +161,25 @@ def make_composite_figure(df):
     ax.set_xlabel('Strike'); ax.set_ylabel('Composite')
     ax.set_title('Live Composite Exposure & Magnet Levels')
     ax.grid(True)
+
+    # Force x-ticks to interval of 25
+    strike_min = int(df['strike'].min() // 25 * 25)
+    strike_max = int(df['strike'].max() // 25 * 25 + 25)
+    ax.set_xticks(np.arange(strike_min, strike_max + 1, 25))
+
+    # Annotate top 3 magnet strikes
+    top3 = df.nlargest(3, 'final_composite')
+    for _, row in top3.iterrows():
+        ax.annotate(f"{int(row['strike'])}", xy=(row['strike'], row['final_composite']),
+                    xytext=(0, 8), textcoords='offset points', ha='center', fontsize=9,
+                    bbox=dict(boxstyle='round,pad=0.2', fc='yellow', alpha=0.3))
+
     return fig
 
-@st.cache_data(ttl=30)
+# ---------------------------
+# Data fetch (cached 30s)
+# ---------------------------
+@st.cache(ttl=30)
 def fetch_data():
     tok = load_tokens()
     tok = refresh_access_token(tok)
@@ -175,21 +197,10 @@ def fetch_data():
 # Streamlit UI
 # ---------------------------
 st.title("Live SPX Composite Exposure")
-
-if not os.path.exists(TOKEN_FILE):
-    uploaded = st.file_uploader("Upload 'schwab_tokens.json'", type='json')
-    if uploaded:
-        with open(TOKEN_FILE, "wb") as f:
-            f.write(uploaded.read())
-        st.experimental_rerun()
-    else:
-        st.stop()
-
 placeholder = st.empty()
+
 while True:
     df = fetch_data()
     fig = make_composite_figure(df)
     placeholder.pyplot(fig)
     time.sleep(30)
-
-
