@@ -1,5 +1,5 @@
 # streamlit_app.py
-import time, json, requests, pandas as pd, numpy as np
+import time, json, requests, pandas as pd, numpy as np, os
 import matplotlib.pyplot as plt, streamlit as st
 from datetime import datetime
 from math import log, sqrt
@@ -15,7 +15,7 @@ CLIENT_ID     = st.secrets["CLIENT_ID"]
 CLIENT_SECRET = st.secrets["CLIENT_SECRET"]
 REDIRECT_URI  = st.secrets["REDIRECT_URI"]
 UNDERLYING    = '$SPX'
-STRIKE_COUNT  = 50     # change to 100 or 200 if your API supports it
+STRIKE_COUNT  = 50
 STRIKE_MIN    = 5600
 STRIKE_MAX    = 6100
 
@@ -23,6 +23,9 @@ STRIKE_MAX    = 6100
 # OAuth token management
 # ---------------------------
 def load_tokens():
+    if not os.path.exists(TOKEN_FILE):
+        st.error("Token file not found. Please upload 'schwab_tokens.json' via the file uploader below.")
+        st.stop()
     with open(TOKEN_FILE) as f:
         return json.load(f)
 
@@ -84,9 +87,6 @@ def black_scholes_vanna(S, K, T, sigma, r=0.0):
     d2 = d1 - sigma * sqrt(T)
     return -d2 * norm.pdf(d1) / sigma
 
-# ---------------------------
-# Smoothed IV interpolation
-# ---------------------------
 def get_smoothed_iv(strikes, ivs):
     s = np.array(strikes); v = np.array(ivs)
     mask = ~np.isnan(v)
@@ -98,12 +98,8 @@ def get_smoothed_iv(strikes, ivs):
     v_u = [v[idx][np.where(s[idx]==k)[0][0]] for k in s_u]
     return make_interp_spline(s_u, v_u, k=3)
 
-# ---------------------------
-# Build exposures DataFrame
-# ---------------------------
 def chain_to_df(chain, spot):
     rows = []
-    # Calls
     for exp, strikes in chain.get('callExpDateMap', {}).items():
         for K, rec in strikes.items():
             d = rec[0]
@@ -115,7 +111,6 @@ def chain_to_df(chain, spot):
                 'call_bid': d.get('bid', np.nan), 'call_ask': d.get('ask', np.nan),
                 'call_mark': d.get('mark', np.nan), 'call_volume': d['totalVolume']
             })
-    # Puts
     for exp, strikes in chain.get('putExpDateMap', {}).items():
         for K, rec in strikes.items():
             d = rec[0]
@@ -130,27 +125,22 @@ def chain_to_df(chain, spot):
     df = pd.DataFrame(rows)
     df['exp_t'] = df['exp'].apply(calc_time_to_expiration)
     df = df[(df['strike']>=STRIKE_MIN)&(df['strike']<=STRIKE_MAX)]
-    # smooth & avg IV
     df['call_iv'].fillna(0, inplace=True)
     df['put_iv'].fillna(0, inplace=True)
     iv_c = get_smoothed_iv(df['strike'], df['call_iv'])
     iv_p = get_smoothed_iv(df['strike'], df['put_iv'])
     df['avg_iv'] = df['strike'].apply(lambda k: (iv_c(k)+iv_p(k))/2)
-    # BS Greeks
     df['bs_gamma'] = df.apply(lambda r: black_scholes_gamma(spot, r['strike'], r['exp_t'], r['avg_iv']), axis=1)
     df['bs_charm'] = df.apply(lambda r: black_scholes_charm(spot, r['strike'], r['exp_t'], r['avg_iv']), axis=1)
     df['bs_vanna'] = df.apply(lambda r: black_scholes_vanna(spot, r['strike'], r['exp_t'], r['avg_iv']), axis=1)
-    # aggregate and exposures
     df = df.groupby(['exp','exp_t','strike'], as_index=False).sum()
     df['gex'] = (df['bs_gamma']*(df['call_open_int']-df['put_open_int']))*100
     df['dex'] = (df['call_delta']*df['call_open_int']+df['put_delta']*df['put_open_int'])*100
     df['vex'] = (df['call_vega']*df['call_open_int']-df['put_vega']*df['put_open_int'])*100
-    # directional volume
     df['call_td'] = np.where((df['call_mark']-df['call_bid']).abs()<(df['call_ask']-df['call_mark']).abs(),1,-1)
     df['put_td']  = np.where((df['put_ask']-df['put_mark']).abs()<(df['put_mark']-df['put_bid']).abs(),-1,1)
     df['dir_vol_gamma'] = df['call_volume']*df['bs_gamma']*df['call_delta']*df['call_td']\
                         + df['put_volume']*df['bs_gamma']*df['put_delta']*df['put_td']
-    # final composite
     df['n_gex'] = safe_normalize(df['gex'])
     df['n_dex'] = safe_normalize(df['dex'])
     df['n_vex'] = safe_normalize(df['vex'])
@@ -158,9 +148,6 @@ def chain_to_df(chain, spot):
     df['final_composite'] = df[['n_gex','n_dex','n_vex','n_dir_gamma']].sum(axis=1)
     return df
 
-# ---------------------------
-# Plotting
-# ---------------------------
 def make_composite_figure(df):
     fig, ax = plt.subplots(figsize=(10,5))
     ax.plot(df['strike'], df['final_composite'], marker='o', linewidth=2)
@@ -170,10 +157,7 @@ def make_composite_figure(df):
     ax.grid(True)
     return fig
 
-# ---------------------------
-# Data fetch (cached 30s)
-# ---------------------------
-@st.cache(ttl=30)
+@st.cache_data(ttl=30)
 def fetch_data():
     tok = load_tokens()
     tok = refresh_access_token(tok)
@@ -191,11 +175,20 @@ def fetch_data():
 # Streamlit UI
 # ---------------------------
 st.title("Live SPX Composite Exposure")
-placeholder = st.empty()
 
-# continuous redraw
+if not os.path.exists(TOKEN_FILE):
+    uploaded = st.file_uploader("Upload 'schwab_tokens.json'", type='json')
+    if uploaded:
+        with open(TOKEN_FILE, "wb") as f:
+            f.write(uploaded.read())
+        st.experimental_rerun()
+    else:
+        st.stop()
+
+placeholder = st.empty()
 while True:
     df = fetch_data()
     fig = make_composite_figure(df)
     placeholder.pyplot(fig)
     time.sleep(30)
+
