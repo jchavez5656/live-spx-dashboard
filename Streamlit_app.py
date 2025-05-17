@@ -192,3 +192,4 @@ while True:
     placeholder.pyplot(fig)
     time.sleep(30)
 
+
