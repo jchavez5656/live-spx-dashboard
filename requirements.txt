@@ -1,7 +1,7 @@
-streamlit>=1.33.0
+streamlit
 requests
 pandas
 numpy
-scipy
 matplotlib
-plotly
+scipy
+statsmodels
