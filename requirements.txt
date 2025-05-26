@@ -1,6 +1,7 @@
-streamlit
+streamlit>=1.33.0
 requests
 pandas
 numpy
 scipy
 matplotlib
+plotly
