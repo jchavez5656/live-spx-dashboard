@@ -1,206 +1,219 @@
-# streamlit_app.py
-import time, json, requests, pandas as pd, numpy as np
-import matplotlib.pyplot as plt, streamlit as st
-from datetime import datetime
-from math import log, sqrt
-from scipy.stats import norm
-from scipy.interpolate import make_interp_spline, interp1d
-from requests.auth import HTTPBasicAuth
+import streamlit as st
+import pandas as pd
+import numpy as np
+import requests
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from datetime import datetime, timedelta
+import json
+import os
 
-# ---------------------------
-# Configuration (from Streamlit secrets)
-# ---------------------------
-TOKEN_FILE    = 'schwab_tokens.json'
-CLIENT_ID     = st.secrets["CLIENT_ID"]
-CLIENT_SECRET = st.secrets["CLIENT_SECRET"]
-REDIRECT_URI  = st.secrets["REDIRECT_URI"]
-UNDERLYING    = '$SPX'
-STRIKE_COUNT  = 50
-STRIKE_MIN    = 5600
-STRIKE_MAX    = 6100
+# ------------------- CONFIG -------------------
+CLIENT_ID = "TeyurKNMQmDOlYa8v534SYvGDgnbt1H6"
+CLIENT_SECRET = "cYHDTdzmQX4nKrGM"
+REDIRECT_URI = "https://jchavez5656.github.io/chavez-redirect/"
+TOKEN_FILE = "token.json"
 
-# ---------------------------
-# OAuth token management
-# ---------------------------
+# ------------------- AUTH HELPERS -------------------
 def load_tokens():
-    with open(TOKEN_FILE) as f:
-        return json.load(f)
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, 'r') as f:
+            return json.load(f)
+    return None
 
 def save_tokens(tokens):
     with open(TOKEN_FILE, 'w') as f:
         json.dump(tokens, f)
 
-def refresh_access_token(tok):
-    resp = requests.post(
-        'https://api.schwabapi.com/v1/oauth/token',
-        data={
-            'grant_type': 'refresh_token',
-            'refresh_token': tok['refresh_token'],
-            'redirect_uri': REDIRECT_URI
-        },
-        auth=HTTPBasicAuth(CLIENT_ID, CLIENT_SECRET),
-        headers={'Content-Type': 'application/x-www-form-urlencoded'}
-    )
-    resp.raise_for_status()
-    new_tok = resp.json()
-    save_tokens(new_tok)
-    return new_tok
+def refresh_access_token(refresh_token):
+    url = "https://api.schwabapi.com/v1/oauth/token"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "redirect_uri": REDIRECT_URI
+    }
+    response = requests.post(url, headers=headers, data=data)
+    if response.ok:
+        tokens = response.json()
+        tokens['refresh_token'] = refresh_token
+        save_tokens(tokens)
+        return tokens['access_token']
+    else:
+        st.error("Token refresh failed.")
+        st.stop()
 
-# ---------------------------
-# Helper functions & Greeks
-# ---------------------------
-def safe_normalize(s):
-    m = s.abs().max()
-    return s * 0 if not m or np.isnan(m) else s / m
+def get_access_token():
+    tokens = load_tokens()
+    if tokens:
+        return refresh_access_token(tokens['refresh_token'])
+    else:
+        st.error("No token found. Please authenticate first.")
+        st.stop()
 
-def dynamic_width(strikes):
-    u = np.sort(np.unique(strikes))
-    return 10 if len(u) < 2 else 0.8 * np.mean(np.diff(u))
+# ------------------- SCHWAB API -------------------
+def fetch_option_chain(symbol, access_token):
+    url = f"https://api.schwabapi.com/marketdata/v1/chains"
+    params = {
+        "symbol": symbol,
+        "includeQuotes": "FALSE",
+        "strategy": "SINGLE",
+        "contractType": "ALL",
+        "range": "ALL"
+    }
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.get(url, headers=headers, params=params)
+    if response.ok:
+        return response.json()
+    else:
+        st.error("Failed to fetch option chain.")
+        st.stop()
 
-def calc_time_to_expiration(exp_str):
-    try:
-        d = datetime.strptime(exp_str[:10], '%Y-%m-%d')
-        return max((d - datetime.utcnow()).days / 365.0, 0)
-    except:
-        return 0
+# ------------------- METRIC CALCS -------------------
+def calc_exposure_data(chain_data):
+    calls = []
+    puts = []
 
-def black_scholes_gamma(S, K, T, sigma, r=0.0):
-    if T <= 0 or sigma <= 0:
-        return 0
-    d1 = (log(S/K) + (r + 0.5*sigma**2)*T) / (sigma * sqrt(T))
-    return norm.pdf(d1) / (S * sigma * sqrt(T))
+    strike_prices = set()
 
-def black_scholes_charm(S, K, T, sigma, r=0.0):
-    if T <= 0 or sigma <= 0:
-        return 0
-    d1 = (log(S/K) + (r + 0.5*sigma**2)*T) / (sigma * sqrt(T))
-    dd1 = (r + 0.5*sigma**2)/(2*sigma*sqrt(T)) - (log(S/K))/(2*sigma*(T**1.5))
-    return norm.pdf(d1) * dd1
-
-def black_scholes_vanna(S, K, T, sigma, r=0.0):
-    if T <= 0 or sigma <= 0:
-        return 0
-    d1 = (log(S/K) + (r + 0.5*sigma**2)*T) / (sigma * sqrt(T))
-    d2 = d1 - sigma * sqrt(T)
-    return -d2 * norm.pdf(d1) / sigma
-
-# ---------------------------
-# Smoothed IV interpolation
-# ---------------------------
-def get_smoothed_iv(strikes, ivs):
-    s = np.array(strikes); v = np.array(ivs)
-    mask = ~np.isnan(v)
-    s, v = s[mask], v[mask]
-    if len(s) < 4:
-        return interp1d(s, v, kind='linear', fill_value='extrapolate')
-    idx = np.argsort(s)
-    s_u = np.unique(s[idx])
-    v_u = [v[idx][np.where(s[idx]==k)[0][0]] for k in s_u]
-    return make_interp_spline(s_u, v_u, k=3)
-
-# ---------------------------
-# Build exposures DataFrame
-# ---------------------------
-def chain_to_df(chain, spot):
-    rows = []
-    for exp, strikes in chain.get('callExpDateMap', {}).items():
-        for K, rec in strikes.items():
-            d = rec[0]
-            rows.append({
-                'exp': exp[:10], 'strike': float(K),
-                'call_open_int': d['openInterest'], 'call_delta': d['delta'],
-                'call_gamma': d['gamma'], 'call_vega': d['vega'],
-                'call_iv': d.get('volatility', np.nan)/100,
-                'call_bid': d.get('bid', np.nan), 'call_ask': d.get('ask', np.nan),
-                'call_mark': d.get('mark', np.nan), 'call_volume': d['totalVolume']
+    for strike, contracts in chain_data.get("callExpDateMap", {}).items():
+        for strike_price, data in contracts.items():
+            option = data[0]
+            calls.append({
+                "strike": float(option["strikePrice"]),
+                "openInterest": option["openInterest"],
+                "delta": option.get("delta", 0),
+                "gamma": option.get("gamma", 0),
+                "vega": option.get("vega", 0),
+                "type": "call"
             })
-    for exp, strikes in chain.get('putExpDateMap', {}).items():
-        for K, rec in strikes.items():
-            d = rec[0]
-            rows.append({
-                'exp': exp[:10], 'strike': float(K),
-                'put_open_int': d['openInterest'], 'put_delta': -abs(d['delta']),
-                'put_gamma': d['gamma'], 'put_vega': d['vega'],
-                'put_iv': d.get('volatility', np.nan)/100,
-                'put_bid': d.get('bid', np.nan), 'put_ask': d.get('ask', np.nan),
-                'put_mark': d.get('mark', np.nan), 'put_volume': d['totalVolume']
+            strike_prices.add(float(option["strikePrice"]))
+
+    for strike, contracts in chain_data.get("putExpDateMap", {}).items():
+        for strike_price, data in contracts.items():
+            option = data[0]
+            puts.append({
+                "strike": float(option["strikePrice"]),
+                "openInterest": option["openInterest"],
+                "delta": option.get("delta", 0),
+                "gamma": option.get("gamma", 0),
+                "vega": option.get("vega", 0),
+                "type": "put"
             })
-    df = pd.DataFrame(rows)
-    df['exp_t'] = df['exp'].apply(calc_time_to_expiration)
-    df = df[(df['strike']>=STRIKE_MIN)&(df['strike']<=STRIKE_MAX)]
-    df['call_iv'].fillna(0, inplace=True)
-    df['put_iv'].fillna(0, inplace=True)
-    iv_c = get_smoothed_iv(df['strike'], df['call_iv'])
-    iv_p = get_smoothed_iv(df['strike'], df['put_iv'])
-    df['avg_iv'] = df['strike'].apply(lambda k: (iv_c(k)+iv_p(k))/2)
-    df['bs_gamma'] = df.apply(lambda r: black_scholes_gamma(spot, r['strike'], r['exp_t'], r['avg_iv']), axis=1)
-    df['bs_charm'] = df.apply(lambda r: black_scholes_charm(spot, r['strike'], r['exp_t'], r['avg_iv']), axis=1)
-    df['bs_vanna'] = df.apply(lambda r: black_scholes_vanna(spot, r['strike'], r['exp_t'], r['avg_iv']), axis=1)
-    df = df.groupby(['exp','exp_t','strike'], as_index=False).sum()
-    df['gex'] = (df['bs_gamma']*(df['call_open_int']-df['put_open_int']))*100
-    df['dex'] = (df['call_delta']*df['call_open_int']+df['put_delta']*df['put_open_int'])*100
-    df['vex'] = (df['call_vega']*df['call_open_int']-df['put_vega']*df['put_open_int'])*100
-    df['call_td'] = np.where((df['call_mark']-df['call_bid']).abs()<(df['call_ask']-df['call_mark']).abs(),1,-1)
-    df['put_td']  = np.where((df['put_ask']-df['put_mark']).abs()<(df['put_mark']-df['put_bid']).abs(),-1,1)
-    df['dir_vol_gamma'] = df['call_volume']*df['bs_gamma']*df['call_delta']*df['call_td']\
-                        + df['put_volume']*df['bs_gamma']*df['put_delta']*df['put_td']
-    df['n_gex'] = safe_normalize(df['gex'])
-    df['n_dex'] = safe_normalize(df['dex'])
-    df['n_vex'] = safe_normalize(df['vex'])
-    df['n_dir_gamma'] = safe_normalize(df['dir_vol_gamma'])
-    df['final_composite'] = df[['n_gex','n_dex','n_vex','n_dir_gamma']].sum(axis=1)
+            strike_prices.add(float(option["strikePrice"]))
+
+    df = pd.DataFrame(calls + puts)
+    df["DEX"] = df["openInterest"] * df["delta"]
+    df["GEX"] = df["openInterest"] * df["gamma"]
+    df["VEX"] = df["openInterest"] * df["vega"]
     return df
 
-# ---------------------------
-# Plotting
-# ---------------------------
-def make_composite_figure(df):
-    fig, ax = plt.subplots(figsize=(10,5))
-    ax.plot(df['strike'], df['final_composite'], marker='o', linewidth=2)
-    ax.axhline(0, color='black')
-    ax.set_xlabel('Strike'); ax.set_ylabel('Composite')
-    ax.set_title('Live Composite Exposure & Magnet Levels')
-    ax.grid(True)
+def aggregate_metrics(df):
+    grouped = df.groupby("strike").agg({
+        "DEX": "sum",
+        "GEX": "sum",
+        "VEX": "sum"
+    }).reset_index()
+    return grouped
 
-    # Force x-ticks to interval of 25
-    strike_min = int(df['strike'].min() // 25 * 25)
-    strike_max = int(df['strike'].max() // 25 * 25 + 25)
-    ax.set_xticks(np.arange(strike_min, strike_max + 1, 25))
+def find_top_magnets(df):
+    df["absGEX"] = df["GEX"].abs()
+    top = df.sort_values("absGEX", ascending=False).head(3)
+    return top["strike"].tolist()
 
-    # Annotate top 3 magnet strikes
-    top3 = df.nlargest(3, 'final_composite')
-    for _, row in top3.iterrows():
-        ax.annotate(f"{int(row['strike'])}", xy=(row['strike'], row['final_composite']),
-                    xytext=(0, 8), textcoords='offset points', ha='center', fontsize=9,
-                    bbox=dict(boxstyle='round,pad=0.2', fc='yellow', alpha=0.3))
+def round_to_nearest_25(x):
+    return int(round(x / 25.0) * 25)
 
-    return fig
+# ------------------- PLOTTING -------------------
+def plot_exposure(df, magnet_levels):
+    fig = go.Figure()
 
-# ---------------------------
-# Data fetch (cached 30s)
-# ---------------------------
-@st.cache(ttl=30)
-def fetch_data():
-    tok = load_tokens()
-    tok = refresh_access_token(tok)
-    hdr = {'Authorization': f"Bearer {tok['access_token']}"}
-    spot = requests.get(f'https://api.schwabapi.com/marketdata/v1/{UNDERLYING}/quotes', headers=hdr)\
-                   .json()[UNDERLYING]['quote']['lastPrice']
-    chain = requests.get(
-        'https://api.schwabapi.com/marketdata/v1/chains',
-        params={'symbol': UNDERLYING, 'strikeCount': STRIKE_COUNT},
-        headers=hdr
-    ).json()
-    return chain_to_df(chain, spot)
+    fig.add_trace(go.Bar(
+        x=df["strike"], y=df["GEX"],
+        name="Gamma Exposure", marker_color="blue"
+    ))
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-st.title("Live SPX Composite Exposure")
-placeholder = st.empty()
+    fig.add_trace(go.Bar(
+        x=df["strike"], y=df["DEX"],
+        name="Delta Exposure", marker_color="orange"
+    ))
 
-while True:
-    df = fetch_data()
-    fig = make_composite_figure(df)
-    placeholder.pyplot(fig)
-    time.sleep(30)
+    fig.add_trace(go.Bar(
+        x=df["strike"], y=df["VEX"],
+        name="Vega Exposure", marker_color="green"
+    ))
+
+    for level in magnet_levels:
+        fig.add_vline(
+            x=level,
+            line=dict(color="red", dash="dash"),
+            annotation_text=f"Magnet: {level}",
+            annotation_position="top"
+        )
+
+    fig.update_layout(
+        barmode="overlay",
+        title="SPX Options Exposure (DEX / GEX / VEX)",
+        xaxis_title="Strike Price",
+        yaxis_title="Exposure",
+        xaxis=dict(
+            tickmode='array',
+            tickvals=np.arange(
+                round_to_nearest_25(df["strike"].min()) - 50,
+                round_to_nearest_25(df["strike"].max()) + 50,
+                25
+            )
+        ),
+        template="plotly_white",
+        height=600
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+# ------------------- MAIN -------------------
+def main():
+    st.title("SPX Options Exposure Dashboard (DEX/GEX/VEX)")
+
+    with st.sidebar:
+        st.header("Schwab OAuth")
+        code = st.text_input("Paste the Authorization Code Here")
+        if st.button("Authorize and Save Tokens"):
+            if not code:
+                st.warning("Paste the code first.")
+                return
+
+            token_url = "https://api.schwabapi.com/v1/oauth/token"
+            headers = {"Content-Type": "application/x-www-form-urlencoded"}
+            data = {
+                "grant_type": "authorization_code",
+                "code": code,
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "redirect_uri": REDIRECT_URI
+            }
+
+            response = requests.post(token_url, headers=headers, data=data)
+            if response.ok:
+                tokens = response.json()
+                save_tokens(tokens)
+                st.success("Tokens saved successfully!")
+            else:
+                st.error("Failed to exchange code for tokens.")
+
+    if not os.path.exists(TOKEN_FILE):
+        st.warning("Please authorize Schwab API using sidebar first.")
+        return
+
+    access_token = get_access_token()
+    data = fetch_option_chain("SPX", access_token)
+    df_raw = calc_exposure_data(data)
+    df = aggregate_metrics(df_raw)
+    magnets = find_top_magnets(df)
+
+    plot_exposure(df, magnets)
+
+if __name__ == "__main__":
+    main()
+
